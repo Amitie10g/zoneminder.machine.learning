@@ -1,9 +1,18 @@
-FROM phusion/baseimage:focal-1.0.0alpha1-amd64 as builder
+ARG	BASEIMG=amitie10g/baseimage
+ARG	BASEIMG_VERS=focal
+ARG	PHP_VERS="7.4"
+ARG	ZM_VERS="1.34"
+FROM	$BASEIMG:$BASEIMG_VERS AS base
 
-LABEL maintainer="dlandon"
+LABEL	maintainer="dlandon"
 
+ARG	BASEIMG_VERS
+ARG	PHP_VERS
+ARG	ZM_VERS
 ENV	DEBCONF_NONINTERACTIVE_SEEN="true" \
 	DEBIAN_FRONTEND="noninteractive" \
+	PYTHONPYCACHEPREFIX="/tmp/pip" \
+	PATH="/opt/venv/bin:$PATH" \
 	DISABLE_SSH="true" \
 	HOME="/root" \
 	LC_ALL="C.UTF-8" \
@@ -11,30 +20,29 @@ ENV	DEBCONF_NONINTERACTIVE_SEEN="true" \
 	LANGUAGE="en_US.UTF-8" \
 	TZ="Etc/UTC" \
 	TERM="xterm" \
-	PHP_VERS="7.4" \
-	ZM_VERS="1.34" \
+	PHP_VERS=$PHP_VERS \
+	ZM_VERS=$ZM_VERS \
 	PUID="99" \
 	PGID="100"
 
-FROM builder as build1
+FROM base AS step1
 COPY init/ /etc/my_init.d/
 COPY defaults/ /root/
 COPY zmeventnotification/ /root/zmeventnotification/
+COPY --from=amitie10g/zoneminder:models / /root/models
 
 RUN	add-apt-repository -y ppa:iconnor/zoneminder-$ZM_VERS && \
 	add-apt-repository ppa:ondrej/php && \
 	add-apt-repository ppa:ondrej/apache2 && \
 	apt-get update && \
-	apt-get -y upgrade -o Dpkg::Options::="--force-confold" && \
-	apt-get -y dist-upgrade -o Dpkg::Options::="--force-confold" && \
 	apt-get -y install apache2 mariadb-server && \
 	apt-get -y install ssmtp mailutils net-tools wget sudo make cmake gcc && \
 	apt-get -y install php$PHP_VERS php$PHP_VERS-fpm libapache2-mod-php$PHP_VERS php$PHP_VERS-mysql php$PHP_VERS-gd && \
 	apt-get -y install libcrypt-mysql-perl libyaml-perl libjson-perl libavutil-dev ffmpeg && \
 	apt-get -y install --no-install-recommends libvlc-dev libvlccore-dev vlc-bin vlc-plugin-base vlc-plugin-video-output && \
 	apt-get -y install zoneminder
-	
-FROM build1 as build2
+
+FROM step1 AS step2
 RUN	rm /etc/mysql/my.cnf && \
 	cp /etc/mysql/mariadb.conf.d/50-server.cnf /etc/mysql/my.cnf && \
 	adduser www-data video && \
@@ -49,32 +57,13 @@ RUN	rm /etc/mysql/my.cnf && \
 	perl -MCPAN -e "force install Net::MQTT::Simple::Auth" && \
 	perl -MCPAN -e "force install Time::Piece"
 
-FROM build2 as build3
-RUN	apt-get -y install python3-pip && \
-	apt-get -y install libopenblas-dev liblapack-dev libblas-dev && \
-	pip3 install future && \
+FROM step2 AS step3
+RUN apt-get -y install libopenblas-dev liblapack-dev libblas-dev libgeos-dev python3-pip python3-setuptools python3-shapely python3-future && \
 	pip3 install /root/zmeventnotification && \
 	pip3 install face_recognition && \
-	rm -r /root/zmeventnotification/zmes_hook_helpers && \
-	cd /root/ && \
-	mkdir -p models/tinyyolov3 && \
-	wget https://pjreddie.com/media/files/yolov3-tiny.weights -O models/tinyyolov3/yolov3-tiny.weights && \
-	wget https://raw.githubusercontent.com/pjreddie/darknet/master/cfg/yolov3-tiny.cfg -O models/tinyyolov3/yolov3-tiny.cfg && \
-	wget https://raw.githubusercontent.com/pjreddie/darknet/master/data/coco.names -O models/tinyyolov3/coco.names && \
-	mkdir -p models/yolov3 && \
-	wget https://raw.githubusercontent.com/pjreddie/darknet/master/cfg/yolov3.cfg -O models/yolov3/yolov3.cfg && \
-	wget https://raw.githubusercontent.com/pjreddie/darknet/master/data/coco.names -O models/yolov3/coco.names && \
-	wget https://pjreddie.com/media/files/yolov3.weights -O models/yolov3/yolov3.weights && \
-	mkdir -p models/tinyyolov4 && \
-	wget https://github.com/AlexeyAB/darknet/releases/download/darknet_yolo_v4_pre/yolov4-tiny.weights -O models/tinyyolov4/yolov4-tiny.weights && \
-	wget https://raw.githubusercontent.com/AlexeyAB/darknet/master/cfg/yolov4-tiny.cfg -O models/tinyyolov4/yolov4-tiny.cfg && \
-	wget https://raw.githubusercontent.com/pjreddie/darknet/master/data/coco.names -O models/tinyyolov4/coco.names && \
-	mkdir -p models/yolov4 && \
-	wget https://raw.githubusercontent.com/AlexeyAB/darknet/master/cfg/yolov4.cfg -O models/yolov4/yolov4.cfg && \
-	wget https://raw.githubusercontent.com/pjreddie/darknet/master/data/coco.names -O models/yolov4/coco.names && \
-	wget https://github.com/AlexeyAB/darknet/releases/download/darknet_yolo_v3_optimal/yolov4.weights -O models/yolov4/yolov4.weights
+	rm -r /root/zmeventnotification/zmes_hook_helpers
 
-FROM build3 as build4
+FROM step3 AS step4
 RUN	cd /root && \
 	chown -R www-data:www-data /usr/share/zoneminder/ && \
 	echo "ServerName localhost" >> /etc/apache2/apache2.conf && \
@@ -88,7 +77,7 @@ RUN	cd /root && \
 	mysql -sfu root < "mysql_defaults.sql" && \
 	rm mysql_defaults.sql
 
-FROM build4 as build5
+FROM step4 AS step5
 RUN	mv /root/zoneminder /etc/init.d/zoneminder && \
 	chmod +x /etc/init.d/zoneminder && \
 	service mysql restart && \
@@ -96,7 +85,7 @@ RUN	mv /root/zoneminder /etc/init.d/zoneminder && \
 	service apache2 start && \
 	service zoneminder start
 
-FROM build5 as build6
+FROM step5 AS step6
 RUN	systemd-tmpfiles --create zoneminder.conf && \
 	mv /root/default-ssl.conf /etc/apache2/sites-enabled/default-ssl.conf && \
 	mkdir /etc/apache2/ssl/ && \
@@ -111,7 +100,7 @@ RUN	systemd-tmpfiles --create zoneminder.conf && \
 	sed -i s#3.13#3.25#g /etc/syslog-ng/syslog-ng.conf && \
 	sed -i 's#use_dns(no)#use_dns(yes)#' /etc/syslog-ng/syslog-ng.conf
 
-FROM build6 as build7
+FROM step6 AS step7
 RUN	cd /root && \
 	wget -q -O opencv.zip https://github.com/opencv/opencv/archive/4.5.1.zip && \
 	wget -q -O opencv_contrib.zip https://github.com/opencv/opencv_contrib/archive/4.5.1.zip && \
@@ -129,19 +118,20 @@ RUN	cd /root && \
 	cd /root && \
 	rm -r opencv*
 
-FROM build7 as build8
+FROM step7 AS step8
 RUN	apt-get -y clean && \
 	apt-get -y autoremove && \
-	rm -rf /tmp/* /var/tmp/* && \
+	rm -rf /tmp/* /var/tmp/* /root/.cache /root/.cpan && \
 	chmod +x /etc/my_init.d/*.sh
 
-FROM build8 as build9
+FROM step8 AS step9
 VOLUME \
 	["/config"] \
 	["/var/cache/zoneminder"]
 
-FROM build9 as build10
+FROM step9 AS step10
 EXPOSE 80 443 9000
 
-FROM build10
+FROM step10
+WORKDIR /root
 CMD ["/sbin/my_init"]
