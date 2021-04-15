@@ -26,11 +26,6 @@ ENV	DEBCONF_NONINTERACTIVE_SEEN="true" \
 	PUID="99" \
 	PGID="100"
 
-COPY init/ /etc/my_init.d/
-COPY defaults/ /root/
-COPY zmeventnotification/ /root/zmeventnotification/
-COPY --from=amitie10g/zoneminder:models / /root/models
-
 # Base packages
 RUN	case $BASEIMG_VERS in bionic|bionic-i386|focal|groovy|hirsute) \
 		add-apt-repository -y ppa:iconnor/zoneminder-$ZM_VERS && \
@@ -40,15 +35,17 @@ RUN	case $BASEIMG_VERS in bionic|bionic-i386|focal|groovy|hirsute) \
 	apt-get update && \
 	apt-get -y install apache2 mariadb-server && \
 	apt-get -y install ssmtp mailutils net-tools wget sudo && \
-	apt-get -y install php$PHP_VERS php$PHP_VERS-fpm libapache2-mod-php$PHP_VERS php$PHP_VERS-mysql php$PHP_VERS-gd && \
-	apt-get -y install libcrypt-mysql-perl libyaml-perl libjson-perl libavutil-dev ffmpeg && \
+	apt-get -y install php$PHP_VERS-fpm libapache2-mod-php$PHP_VERS php$PHP_VERS-mysql php$PHP_VERS-gd && \
+	apt-get -y install libcrypt-mysql-perl libyaml-perl libjson-perl && \
 	sh -lc 'if ! apt-get -y install libopenblas0; then apt-get -y install libopenblas-dev; fi' && \
 	apt-get -y install --no-install-recommends \
 		libvlc-dev \
 		libvlccore-dev \
 		vlc-bin \
 		vlc-plugin-base \
-		vlc-plugin-video-output  \
+		vlc-plugin-video-output \
+		libavutil-dev \
+		ffmpeg \
 		python3-pip \
 		python3-setuptools \
 		python3-shapely \
@@ -72,11 +69,15 @@ RUN apt-get -y install \
 
 # Build dlib
 FROM builder AS python-builder
-RUN python3 -m pip wheel dlib
+RUN python3 -m pip download dlib
+RUN python3 -m pip wheel --default-timeout 1800 dlib
 
 # Build Perl modules
 FROM builder AS perl-builder
 RUN export PERL_MM_USE_DEFAULT=1 && \
+	perl -MCPAN -e "fforce install inc::latest" && \
+	perl -MCPAN -e "fforce install PAR::Dist" && \
+	perl -MCPAN -e "fforce install Protocol::WebSocket" && \
 	perl -MCPAN -e "fforce test Net::WebSocket::Server" && \
 	perl -MCPAN -e "fforce test LWP::Protocol::https" && \
 	perl -MCPAN -e "fforce test Config::IniFiles" && \
@@ -85,22 +86,19 @@ RUN export PERL_MM_USE_DEFAULT=1 && \
 	perl -MCPAN -e "fforce test Time::Piece"
 
 # New container
-FROM base AS step2
+FROM base
 
+COPY init/ /etc/my_init.d/
+COPY defaults/ /tmp/
+COPY zmeventnotification/ /root/zmeventnotification/
+COPY --from=amitie10g/zoneminder:models / /root/models
 COPY --from=python-builder /root/.cache/pip/wheels/ /root/.cache/pip/wheels/
+COPY --from=perl-builder /root/.cpan/ /root/.cpan/
 
 RUN	python3 -m pip install /root/zmeventnotification && \
 	python3 -m pip install dlib && \
 	python3 -m pip install face_recognition && \
-	python3 -m pip install opencv-contrib-python-headless
-
-FROM step2 AS step3
-COPY --from=perl-builder /root/.cpan/ /root/.cpan/
-
-FROM step3 AS step4
-
-# Setup Apache2 and MariaDB
-RUN	\
+	python3 -m pip install opencv-contrib-python-headless && \
 	rm /etc/mysql/my.cnf && \
 	cp /etc/mysql/mariadb.conf.d/50-server.cnf /etc/mysql/my.cnf && \
 	adduser www-data video && \
@@ -113,9 +111,7 @@ RUN	\
 	perl -MCPAN -e "CPAN::Shell->notest('install', 'Config::IniFiles')" && \
 	perl -MCPAN -e "CPAN::Shell->notest('install', 'Net::MQTT::Simple')" && \
 	perl -MCPAN -e "CPAN::Shell->notest('install', 'Net::MQTT::Simple::Auth')" && \
-	perl -MCPAN -e "CPAN::Shell->notest('install', 'Time::Piece')"
-
-RUN	\
+	perl -MCPAN -e "CPAN::Shell->notest('install', 'Time::Piece')" && \
 	chown -R www-data:www-data /usr/share/zoneminder/ && \
 	echo "ServerName localhost" >> /etc/apache2/apache2.conf && \
 	sed -i "s|^;date.timezone =.*|date.timezone = ${TZ}|" /etc/php/$PHP_VERS/apache2/php.ini && \
@@ -123,21 +119,16 @@ RUN	\
 	mysql -uroot < /usr/share/zoneminder/db/zm_create.sql && \
 	mysql -uroot -e "grant all on zm.* to 'zmuser'@localhost identified by 'zmpass';" && \
 	mysqladmin -uroot reload && \
-	mysql -sfu root < "/root/mysql_secure_installation.sql" && \
-	mysql -sfu root < "/root/mysql_defaults.sql" && \
-	rm /root/mysql_defaults.sql /root/mysql_secure_installation.sql
-
-RUN	\
-	mv /root/zoneminder /etc/init.d/zoneminder && \
+	mysql -sfu root < "/tmp/mysql_secure_installation.sql" && \
+	mysql -sfu root < "/tmp/mysql_defaults.sql" && \
+	mv /tmp/zoneminder /etc/init.d/zoneminder && \
 	chmod +x /etc/init.d/zoneminder && \
 	service mysql restart && \
 	sleep 5 && \
 	service apache2 start && \
-	service zoneminder start
-
-RUN	\
+	service zoneminder start && \
 	systemd-tmpfiles --create zoneminder.conf && \
-	mv /root/default-ssl.conf /etc/apache2/sites-enabled/default-ssl.conf && \
+	mv /tmp/default-ssl.conf /etc/apache2/sites-enabled/default-ssl.conf && \
 	mkdir /etc/apache2/ssl/ && \
 	mkdir -p /var/lib/zmeventnotification/images && \
 	chown -R www-data:www-data /var/lib/zmeventnotification/ && \
@@ -148,12 +139,10 @@ RUN	\
 	cp /etc/apache2/ports.conf /etc/apache2/ports.conf.default && \
 	cp /etc/apache2/sites-enabled/default-ssl.conf /etc/apache2/sites-enabled/default-ssl.conf.default && \
 	sed -i s#3.13#3.25#g /etc/syslog-ng/syslog-ng.conf && \
-	sed -i 's#use_dns(no)#use_dns(yes)#' /etc/syslog-ng/syslog-ng.conf
-
-# Cleanup
-RUN	apt-get -y clean && \
+	sed -i 's#use_dns(no)#use_dns(yes)#' /etc/syslog-ng/syslog-ng.conf && \
+	apt-get -y clean && \
 	apt-get -y autoremove && \
-	rm -rf /tmp/* /var/tmp/* /root/.cache /root/.cpan && \
+	rm -rf /tmp/* /var/tmp/* /root/.cache/* /root/.cpan && \
 	chmod +x /etc/my_init.d/*.sh
 
 VOLUME \
